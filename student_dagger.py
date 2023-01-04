@@ -1,28 +1,23 @@
+
 import os
-import shutil
-from tkinter.tix import IMAGE, Tree
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
 from isaacgym import gymapi
 from legged_gym.envs import *
 from legged_gym.utils import get_args, export_policy_as_jit, task_registry, Logger
-
 import torch
+from imitateTSmdn import *
 import numpy as np
 from isaacgym.torch_utils import *
 from PIL import Image as im
 from isaacgym import gymtorch, gymapi, gymutil
-import time
 from collections import deque
 from torchvision.transforms import Resize
 from torch.utils.tensorboard import SummaryWriter
 
-from imitateTSmdn import *
 
 RESIZE = Resize((64, 64))
-
-EXP_NAME = 'clipNORM_epochs16_collect128_env256_obs44_LR0.0001_NORM_epgreedy_0.1_comp12'
-
+EXP_NAME = 'dagger_action_clip_epochs32_collect32_Reuse_5_env1024_obs44_splitdata2'
 # from config import *
 EXPORT_POLICY = False
 RECORD_FRAMES = False
@@ -31,9 +26,10 @@ MOVE_CAMERA = False
 # c1 1024 e32 l32   better than c2
 # c2 1024 e64 l32
 
-NUM_ENVS = 256  # 512
-EPOCHS = 16  # number of epochs
-COLLECT_LENGTH = 128
+NUM_ENVS = 1024  # 512
+EPOCHS = 32  # number of epochs
+COLLECT_LENGTH = 32
+DAGGER_RESUED = 5
 
 BATCH_SIZE = 128  # 128  # mb size
 DATA_DIR = "./"
@@ -42,8 +38,8 @@ LR = 0.0001
 IMAGE_SHAPE = (1, 240, 424)
 ADD_NOISE = False
 HOLE_P = 0.1
-DEVICE = "cuda:0"
-NORM = torch.tensor([1., 3., 3.], device=DEVICE)
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+NORM = torch.tensor([1., 10., 3.], device=DEVICE)
 CLIP = torch.tensor([[-1.28,  0.4],
                      [-7.76, 13.12],
                      [-3.2,  3.6]], device=DEVICE)
@@ -164,12 +160,9 @@ def play(args):
                                       CLIP[:, 0], CLIP[:, 1]).view(-1, 12)
 
         student_actions = policy_eval.sample(obs, depth_obs)
-
-        student_actions = torch.clamp(student_actions.view((-1, 3)) * NORM,
-                                      CLIP[:, 0], CLIP[:, 1]) 
-        student_actions = student_actions.view(-1, 12)
-        if np.random.random() < 0.1:
-            student_actions = student_actions + torch.randn_like(student_actions, device=DEVICE)
+        # student_actions = torch.clamp(student_actions.view((-1, 3)),
+        #                        CLIP[:, 0], CLIP[:, 1])
+        # student_actions = student_actions.view(-1, 12)
         #################################
         obs, _, rews, dones, infos = env.step(student_actions.detach())
 
@@ -204,7 +197,7 @@ def train(model, val_loader, current_train_iter):
     optimizer = optim.Adam(model.parameters(), lr=LR)
     # construct train set
     train_set = CustomTrainDataset(idx=list(range(
-        0, COLLECT_LENGTH)), filename="./tmp_dagger_data/obs_image_rews_action_daggar")
+        0, COLLECT_LENGTH*DAGGER_RESUED)), batch_size=BATCH_SIZE, filename="./tmp_dagger_data/obs_image_rews_action_daggar")
     sampler_train = torch.utils.data.BatchSampler(
         torch.utils.data.RandomSampler(train_set), BATCH_SIZE, False)
 
@@ -213,17 +206,17 @@ def train(model, val_loader, current_train_iter):
                                                batch_size=None)
 
     for batch_now in range(EPOCHS):  # epochs
-        train_loss = trainOnBatch(model,
-                                  loss_function,
-                                  optimizer,
-                                  train_loader)
+        for j in range(DAGGER_RESUED):
+            train_loss = trainOnBatch(model,
+                                      loss_function,
+                                      optimizer,
+                                      train_loader)
 
-        test_loss = test(model, loss_function, val_loader)
-        loss_logging = {**train_loss, **test_loss}
-        for k, v in loss_logging.items():
-            writer.add_scalar(k, v, current_train_iter*EPOCHS+batch_now)
+            test_loss = test(model, loss_function, val_loader)
+            loss_logging = {**train_loss, **test_loss}
+            for k, v in loss_logging.items():
+                writer.add_scalar(k, v, current_train_iter*EPOCHS+batch_now+j)
 
-    if current_train_iter % 1 == 0:
         torch.save(model, f'./runs/{EXP_NAME}/Model_{current_train_iter}.pt')
     return model
 
@@ -237,8 +230,17 @@ def main(args):
 
     data_generator = play(args)
     # current_train_step = 0
+    # generate eval data set
+    for i, data in enumerate(data_generator):
+        if i == 32:
+            break
+        current_frame = data
+        # print(current_data_ind)
+        torch.save(
+            current_frame, f"tmp_dagger_data_test/obs_image_rews_action_daggar_{i}")
+
     val_set = CustomValDataset(idx=list(
-        range(0, 512)), filename="./tmp_dagger_data_test/obs_image_rews_action_daggar")
+        range(0, 32)), filename="./tmp_dagger_data_test/obs_image_rews_action_daggar")
     sampler_val = torch.utils.data.BatchSampler(
         torch.utils.data.RandomSampler(val_set), BATCH_SIZE, False)
     val_loader = torch.utils.data.DataLoader(val_set,
@@ -248,9 +250,9 @@ def main(args):
         current_frame = data
         # print(current_data_ind)
         torch.save(
-            current_frame, f"tmp_dagger_data/obs_image_rews_action_daggar_{i%COLLECT_LENGTH}")
+            current_frame, f"tmp_dagger_data/obs_image_rews_action_daggar_{i%(COLLECT_LENGTH*DAGGER_RESUED)}")
         # train a new student_model once step COLLECT_LENGTH in sim
-        if (i % COLLECT_LENGTH == 0) and (i > 0):
+        if (i % COLLECT_LENGTH == 0) and (i >= (COLLECT_LENGTH*DAGGER_RESUED)):
             # current_train_iter   collect COLLECT_LENGTH data in sim and train, called one iter
             # in one iter, train EPOCHS times one COLLECT_LENGTH data
             student_model = train(

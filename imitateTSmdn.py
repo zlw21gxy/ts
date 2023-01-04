@@ -11,15 +11,7 @@ from typing import List
 from torchvision.transforms import Resize, RandomPerspective, RandomSolarize, GaussianBlur
 
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-TRAIN_VAL_SPLIT = 0.8  # train/val ratio
-EPOCHS = 128  # number of epochs
-BATCH_SIZE = 128  # mb size
-MODEL_FILE = "ImitateModel.pt"
-NOISE_SCALE = 0.1
-LR = 0.0005
-EXP_NAME = "Dagger_whole_clip_norm2_lr0.0005_128batch_imgoise_obsnoise_data1_leakyrelu"
+from student_dagger import RESIZE, EXP_NAME, NUM_ENVS, EPOCHS, COLLECT_LENGTH, DAGGER_RESUED, BATCH_SIZE, LR, DEVICE, NORM, CLIP
 
 
 def custom_loss(input, target):
@@ -40,7 +32,8 @@ class CustomImgT(torch.nn.Module):
         # depth_obs = torch.clamp(-depth_obs, min=depth_near, max=depth_far).view((self.num_envs, -1))
         # depth_obs = torch.clamp(-img, min=depth_near, max=depth_far)
         depth_obs = img
-        depth_obs[torch.rand_like(depth_obs, device=DEVICE) < self.p] = depth_far
+        depth_obs[torch.rand_like(
+            depth_obs, device=DEVICE) < self.p] = depth_far
         # depth_obs = depth_obs / depth_far
         return depth_obs
 
@@ -55,6 +48,7 @@ class CustomTrainDataset(Dataset):
     """
 
     def __init__(self, idx: List = [1, 2, 3], batch_size: int = 128, filename="/home/guxy/data_backup/dataTS/obs_image_rews_action") -> None:
+        np.random.shuffle(idx)
         self.idx = idx    # circular linked list
         self.batch_size = batch_size
         self.__resize = Resize((64, 64))
@@ -62,23 +56,25 @@ class CustomTrainDataset(Dataset):
         self.filename = filename
         self.__reload_current()
         self.__gen_noise()
-        # self.current_batch_usage = 0
+        self.current_batch_usage = 0
         # self.img_transformations = nn.Sequential(Resize((64, 64)), RandomPerspective(0.1, 0.1), CustomImgT(0.05))
-        self.clip = torch.tensor([[-1.28,  0.4],
-                                  [-7.76, 13.12],
-                                  [-3.2,  3.6]], device=DEVICE)
-        self.norm = torch.tensor([1., 3., 3.], device=DEVICE)
+        self.clip = CLIP
+        self.norm = NORM
 
     def __reload_current(self):
+        '''
+        reload a new set of data
+        '''
 
-        self.current_batch_usage = 0
-
-        data = torch.load(self.filename + f"_{self.idx.pop(0)}")
-        self.tensors_obs = data[0][:, 6:50]     # N， 44
-        self.tensors_img = self.__resize(data[1])
-        self.tensors_action = data[3]  # N , 12
-        for idx_now in self.idx:
+        for i in range(COLLECT_LENGTH):   # N = NUM_ENVS * COLLECT_LENGTH
+            idx_now = self.idx.pop(0)
+            if i == 0:
+                data = torch.load(self.filename + f"_{idx_now}")
+                self.tensors_obs = data[0][:, 6:50]     # N， 44
+                self.tensors_img = self.__resize(data[1])
+                self.tensors_action = data[3]  # N , 12
             data = torch.load(self.filename + f"_{idx_now}")
+            self.idx.append(idx_now)
 
             self.tensors_obs = torch.concat(
                 (self.tensors_obs, data[0][:, 6:50]), dim=0)
@@ -87,13 +83,12 @@ class CustomTrainDataset(Dataset):
             self.tensors_action = torch.concat(
                 (self.tensors_action, data[3]), dim=0)
 
-
     def __gen_noise(self):
         noise_vec = torch.zeros(50, device=DEVICE)
         noise_vec[:3] = 0.
         noise_vec[3:6] = 0.
-        noise_vec[6:9] = 0.05
-        noise_vec[9:12] = 0.  # commands
+        noise_vec[6:9] = 0.05  # gravity
+        noise_vec[9:12] = 0.   # commands
         noise_vec[12:24] = 0.01 * 1.0
         noise_vec[24:36] = 1.5 * 0.05
         noise_vec[36:48] = 0.  # previous actions
@@ -101,6 +96,10 @@ class CustomTrainDataset(Dataset):
         self.noise_scale_vec = noise_vec[6:50]
 
     def __getitem__(self, index):
+        self.current_batch_usage += 1
+        if self.current_batch_usage * self.batch_size > self.tensors_obs.size(0):
+            self.__reload_current()
+            self.current_batch_usage = 0
 
         obs = self.tensors_obs[index]
         img = self.tensors_img[index][:, None, :, :]
@@ -108,11 +107,12 @@ class CustomTrainDataset(Dataset):
         # add noise to img
         img = self.img_transformations(img)
         # add noise to obs
-        obs += (2 * torch.rand_like(obs, device=DEVICE) - 1) * self.noise_scale_vec
+        obs += (2 * torch.rand_like(obs, device=DEVICE) - 1) * \
+            self.noise_scale_vec
 
         action = self.tensors_action[index]
-        action = torch.clamp(action.view((-1, 3)),
-                             self.clip[:, 0], self.clip[:, 1]) / self.norm
+        action = torch.clamp(action.view((-1, 3)) / self.norm,
+                             self.clip[:, 0], self.clip[:, 1])
         action = action.view(-1, 12)
         return obs, img, action
 
@@ -135,11 +135,8 @@ class CustomValDataset(Dataset):
         self.img_transformations = nn.Sequential(
             Resize((64, 64)), CustomImgT(0.05))
         self.filename = filename
-        self.clip = torch.tensor([[-1.28,  0.4],
-                                  [-7.76, 13.12],
-                                  [-3.2,  3.6]], device=DEVICE)
-
-        self.norm = torch.tensor([1., 3., 3.], device=DEVICE)
+        self.clip = CLIP
+        self.norm = NORM
         self.__reload_current()
         # self.current_batch_usage = 0
         # self.img_transformations = nn.Sequential(Resize((64, 64)), RandomPerspective(0.1, 0.1), CustomImgT(0.05))
@@ -163,16 +160,20 @@ class CustomValDataset(Dataset):
             self.tensors_action = torch.concat(
                 (self.tensors_action, data[3][:1024, :]), dim=0)
 
-
     def __getitem__(self, index):
 
         obs = self.tensors_obs[index]
         # get depth
         img = self.tensors_img[index][:, None, :, :]
-
+        # _img_previous = self.tensors_img[[_ind-1 if _ind>0 else 0 for _ind in index]]
+        # img = torch.stack((_img_previous, _img_now), dim=1)
+        # transform img
+        # img = self.img_transformations(img)
+        # add noise to obs
+        # obs += (2 * torch.rand_like(obs) - 1) * self.noise_scale_vec
         action = self.tensors_action[index]
-        action = torch.clamp(action.view((-1, 3)),
-                             self.clip[:, 0], self.clip[:, 1]) / self.norm
+        action = torch.clamp(action.view((-1, 3)) / self.norm,
+                             self.clip[:, 0], self.clip[:, 1])
         action = action.view(-1, 12)
 
         return obs, img, action
@@ -224,13 +225,6 @@ class BcModel(torch.nn.Module):
         self.depth_net = CnnModel(image_shape=(
             1, 64, 64), activation=nn.LeakyReLU(), out_dim=256)
 
-        # self.action_net = torch.nn.Sequential(
-        # torch.nn.Linear(128+256, 512),
-        # torch.nn.ELU(),
-        # torch.nn.BatchNorm1d(512),
-        # torch.nn.Dropout(0.2),
-        # torch.nn.Linear(512, 12),
-
     def forward(self, obs, img):
         '''
         obs: N, 450
@@ -244,6 +238,68 @@ class BcModel(torch.nn.Module):
         return emb_to_mdn
 
 
+class CustomTrainDataset2(Dataset):
+    r"""Dataset wrapping tensors.
+
+    Each sample will be retrieved by indexing tensors along the first dimension.
+
+    Args:
+        *tensors (Tensor): tensors that have the same size of the first dimension.
+    """
+
+    def __init__(self, idx: List = [1, 2, 3], batch_size: int = 128) -> None:
+        self.idx = idx
+        self.batch_size = batch_size
+        self.img_transformations = nn.Sequential(
+            Resize((64, 64)), CustomImgT(0.05))
+
+        self.__reload_current()
+        # self.current_batch_usage = 0
+        # self.img_transformations = nn.Sequential(Resize((64, 64)), RandomPerspective(0.1, 0.1), CustomImgT(0.05))
+        self.clip = CLIP
+        self.norm = NORM
+
+    def __reload_current(self):
+
+        self.current_batch_usage = 0
+        data = torch.load(
+            f"/home/guxy/project/dog/fold/imitate/tmp_dagger_data/obs_image_rews_action_daggar_{self.idx.pop()}")
+        self.tensors_obs = data[0][:1024, 6:50]
+
+        self.tensors_img = self.img_transformations(data[1])
+        self.tensors_action = data[3][:1024, :]
+
+        for idx_now in self.idx:
+            data = torch.load(
+                f"/home/guxy/project/dog/fold/imitate/tmp_dagger_data/obs_image_rews_action_daggar_{idx_now}")
+            self.tensors_obs = torch.concat(
+                (self.tensors_obs, data[0][:1024, 6:50]), dim=0)
+            _img = self.img_transformations(data[1])
+            self.tensors_img = torch.concat((self.tensors_img, _img), dim=0)
+            self.tensors_action = torch.concat(
+                (self.tensors_action, data[3][:1024, :]), dim=0)
+
+        self.tensors_obs[:, :6][self.tensors_obs[:, :6] >= 0] = 1
+        self.tensors_obs[:, :6][self.tensors_obs[:, :6] < 0] = -1
+
+    def __getitem__(self, index):
+
+        obs = self.tensors_obs[index]
+        # get depth
+        img = self.tensors_img[index][:, None, :, :]
+
+        # add noise to obs
+        # obs += (2 * torch.rand_like(obs) - 1) * self.noise_scale_vec
+        action = self.tensors_action[index]
+        action = torch.clamp(action.view((-1, 3)),
+                             self.clip[:, 0], self.clip[:, 1])
+        action = action.view(-1, 12)
+
+        return obs, img, action
+
+    def __len__(self):
+        return self.tensors_obs.size(0)
+
 
 def create_datasets():
     """Create training and validation datasets"""
@@ -251,7 +307,7 @@ def create_datasets():
     # train_set = CustomTrainDataset(idx=list(range(0, 4000)))
     # train_set = CustomTrainDataset(idx=list(range(0, 128)), filename="/home/guxy/project/dog/fold/imitate/tmp_dagger_data/obs_image_rews_action_daggar")
     train_set = CustomTrainDataset(idx=list(range(
-        0, 32)), filename="/home/guxy/project/dog/fold/imitate/tmp_dagger_data_test/obs_image_rews_action_daggar")
+        0, 1024)), batch_size=BATCH_SIZE, filename="/home/guxy/project/dog/fold/imitate/tmp_dagger_data/obs_image_rews_action_daggar")
     # train_set = CustomTrainDataset2(idx=list(range(0, 32)))
 
     sampler_train = torch.utils.data.BatchSampler(
@@ -261,7 +317,8 @@ def create_datasets():
                                                sampler=sampler_train,
                                                batch_size=None)
 
-    val_set = CustomValDataset(idx=list(range(4000, 4006)))
+    val_set = CustomValDataset(idx=list(range(
+        0, 3)), filename="/home/guxy/project/dog/fold/imitate/tmp_dagger_data_test/obs_image_rews_action_daggar")
     sampler_val = torch.utils.data.BatchSampler(
         torch.utils.data.RandomSampler(val_set), BATCH_SIZE, False)
     val_loader = torch.utils.data.DataLoader(val_set,
@@ -280,8 +337,8 @@ def trainOnBatch(model, loss_function, optimizer, data_loader):
     # current_L1 = 0.
     # iterate over the training data
     for i, (obs, img, action) in enumerate(data_loader):
-        # obs: N, 50
-        # img: N, 2, 64, 64
+        # obs: N, 44
+        # img: N, 1, 64, 64
         # action: N, 12
         # zero the parameter gradients
         optimizer.zero_grad()
@@ -319,7 +376,7 @@ def train(model):
     train_loader, val_lorder = create_datasets()  # read datasets
 
     # train
-    with tqdm(range(EPOCHS)) as bar:
+    with tqdm(range(32*EPOCHS)) as bar:
         for batch_now in bar:
             # print('batch_now {}/{}'.format(batch_now + 1, EPOCHS*4000))
             train_loss = trainOnBatch(model,
@@ -327,7 +384,6 @@ def train(model):
                                       optimizer,
                                       train_loader)
             # # save model
-            # model_path = os.path.join(DATA_DIR, MODEL_FILE)
             # torch.save(model.state_dict(), model_path)
             if batch_now % 1 == 0:
                 test_loss = test(model, loss_function, val_lorder)
@@ -405,6 +461,6 @@ if __name__ == '__main__':
 
     # imitate_model = QuantileModel(hidden=[512, 256, 64]).to(DEVICE)
     imitate_model = BcModel().to(DEVICE)
-    mdn_model = MixtureDensityNetwork(256+128, 12, n_components=8).to(DEVICE)
+    mdn_model = MixtureDensityNetwork(256+128, 12, n_components=12).to(DEVICE)
 
     train(MyModel(imitate_model, mdn_model))
