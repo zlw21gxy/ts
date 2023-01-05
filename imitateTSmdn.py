@@ -142,23 +142,23 @@ class CustomValDataset(Dataset):
         # self.img_transformations = nn.Sequential(Resize((64, 64)), RandomPerspective(0.1, 0.1), CustomImgT(0.05))
 
     def __reload_current(self):
-
+        # :16 due to GPU memory limit
         self.current_batch_usage = 0
         data = torch.load(self.filename + f"_{self.idx.pop()}")
-        self.tensors_obs = data[0][:1024, 6:50]
+        self.tensors_obs = data[0][:16, 6:50]
 
-        self.tensors_img = self.img_transformations(data[1])
-        self.tensors_action = data[3][:1024, :]
+        self.tensors_img = self.img_transformations(data[1])[:16, ...]
+        self.tensors_action = data[3][:16, :]
 
         for idx_now in self.idx:
             data = torch.load(
                 self.filename + f"_{idx_now}")
             self.tensors_obs = torch.concat(
-                (self.tensors_obs, data[0][:1024, 6:50]), dim=0)
-            _img = self.img_transformations(data[1])
+                (self.tensors_obs, data[0][:16, 6:50]), dim=0)
+            _img = self.img_transformations(data[1])[:16, ...]
             self.tensors_img = torch.concat((self.tensors_img, _img), dim=0)
             self.tensors_action = torch.concat(
-                (self.tensors_action, data[3][:1024, :]), dim=0)
+                (self.tensors_action, data[3][:16, :]), dim=0)
 
     def __getitem__(self, index):
 

@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 RESIZE = Resize((64, 64))
-EXP_NAME = 'dagger_action_clip_epochs32_collect32_Reuse_5_env1024_obs44_splitdata2'
+EXP_NAME = 'dagger_action_clip_epochs32_collect32_Reuse_5_env512_obs44_splitdata'
 # from config import *
 EXPORT_POLICY = False
 RECORD_FRAMES = False
@@ -26,7 +26,7 @@ MOVE_CAMERA = False
 # c1 1024 e32 l32   better than c2
 # c2 1024 e64 l32
 
-NUM_ENVS = 1024  # 512
+NUM_ENVS = 512  # 512
 EPOCHS = 32  # number of epochs
 COLLECT_LENGTH = 32
 DAGGER_RESUED = 5
@@ -232,7 +232,7 @@ def main(args):
     # current_train_step = 0
     # generate eval data set
     for i, data in enumerate(data_generator):
-        if i == 32:
+        if i == 512:
             break
         current_frame = data
         # print(current_data_ind)
@@ -240,7 +240,7 @@ def main(args):
             current_frame, f"tmp_dagger_data_test/obs_image_rews_action_daggar_{i}")
 
     val_set = CustomValDataset(idx=list(
-        range(0, 32)), filename="./tmp_dagger_data_test/obs_image_rews_action_daggar")
+        range(0, 512)), filename="./tmp_dagger_data_test/obs_image_rews_action_daggar")
     sampler_val = torch.utils.data.BatchSampler(
         torch.utils.data.RandomSampler(val_set), BATCH_SIZE, False)
     val_loader = torch.utils.data.DataLoader(val_set,
